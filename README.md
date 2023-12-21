@@ -10,7 +10,7 @@ See Mozilla Firefox bugs for details (https://bugzilla.mozilla.org/show_bug.cgi?
 ## Usage
 
 Wayland proxy can be run as stand alone application or as a library. Stand alone application can be build
-by 'compile' script at '/src' and then run Wayland application as
+by `compile` script at `src` dir and then run Wayland application as
 
 ```
   ./wayland-proxy application_path
