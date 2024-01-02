@@ -20,11 +20,13 @@ Library version can be attached to your Wayland application.
 Create proxy **BEFORE** you connect app to Wayland display (usually `gtk_init()` or `wl_display_connect()` calls).
 
 ```
+  // Enable logging
+  WaylandProxy::SetVerbose(true);
+
   // Create and run Wayland proxy in extra thread
   std::unique_ptr<WaylandProxy> proxy = WaylandProxy::Create();
   if (proxy) {
     // Enable debug output
-    proxy->SetVerbose(true);
     proxy->RunThread();
   }
 ```
