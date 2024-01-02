@@ -25,8 +25,7 @@ Create proxy **BEFORE** you connect app to Wayland display (usually `gtk_init()`
 
   // Create and run Wayland proxy in extra thread
   std::unique_ptr<WaylandProxy> proxy = WaylandProxy::Create();
-  if (proxy) {
-    // Enable debug output
+  if (proxy) {    
     proxy->RunThread();
   }
 ```
