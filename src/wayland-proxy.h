@@ -25,7 +25,7 @@ class WaylandProxy {
   bool RunThread();
 
   void SetWaylandDisplay();
-  void SetVerbose(bool aVerbose);
+  static void SetVerbose(bool aVerbose);
 
   ~WaylandProxy();
 

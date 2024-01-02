@@ -10,10 +10,10 @@ int main(int argc, char* argv[]) {
     printf("Wayland proxy load balancer, run as:\n\n%s application_name\n\n", argv[0]);
     return 0;
   }
+  WaylandProxy::SetVerbose(true);
   auto proxy = WaylandProxy::Create();
   if (!proxy) {
     return 1;
   }
-  proxy->SetVerbose(true);
   return !proxy->RunChildApplication(argv+1);
 }

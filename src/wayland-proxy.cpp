@@ -6,7 +6,7 @@
 // This code is based on Rust implementation at
 // https://github.com/the8472/weyland-p5000
 
-// Version 1.0
+// Version 1.1
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -96,6 +96,7 @@ class WaylandMessage {
 class ProxiedConnection {
  public:
   bool Init(int aChildSocket);
+  bool IsConnected() { return mCompositorConnected; }
 
   struct pollfd* AddToPollFd(struct pollfd* aPfds);
   struct pollfd* LoadPollFd(struct pollfd* aPfds);
@@ -282,7 +283,7 @@ bool ProxiedConnection::Init(int aApplicationSocket) {
   mCompositorSocket =
       socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
   if (mCompositorSocket == -1) {
-    Error("ConnectToCompositor() socket()");
+    Error("ProxiedConnection::Init() socket()");
   }
   return mApplicationSocket > 0 && mCompositorSocket > 0;
 }
@@ -433,6 +434,7 @@ bool ProxiedConnection::Process() {
   } else {
     // Try to reconnect to compositor.
     if (!ConnectToCompositor()) {
+      Info("Failed to connect to compositor\n");
       return false;
     }
     // We're not connected yet but ConnectToCompositor() didn't return
@@ -488,6 +490,7 @@ bool WaylandProxy::SetupWaylandDisplays() {
     return false;
   }
 
+  Info("WaylandProxy Wayland '%s' proxy '%s'\n", sWaylandDisplay, sWaylandProxy);
   return true;
 }
 
@@ -562,13 +565,18 @@ bool WaylandProxy::PollConnections() {
   for (auto const& connection : mConnections) {
     addedPollfd = connection->AddToPollFd(addedPollfd);
   }
+  int nfds = (addedPollfd - pollfds);
 
-  // Add extra listening socket
-  addedPollfd->fd = mProxyServerSocket;
-  addedPollfd->events = POLLIN;
+  // If all connections are attached to compositor, add another one
+  // for new potential connection from application.
+  bool addNewConnection = mConnections.empty() ||
+                          mConnections.back()->IsConnected();
+  if (addNewConnection) {
+    addedPollfd->fd = mProxyServerSocket;
+    addedPollfd->events = POLLIN;
+    nfds++;
+  }
   assert(addedPollfd < pollfds + nfds_max);
-
-  int nfds = (addedPollfd - pollfds) + 1;
 
   while (1) {
     int ret = poll(pollfds, nfds, POLL_TIMEOUT);
@@ -602,7 +610,7 @@ bool WaylandProxy::PollConnections() {
   assert(loadedPollfd < pollfds + nfds_max);
 
   // Create a new connection if there's a new client waiting
-  if (loadedPollfd->revents & POLLIN) {
+  if (addNewConnection && (loadedPollfd->revents & POLLIN)) {
     Info("WaylandProxy: new child connection\n");
     int applicationSocket = accept4(loadedPollfd->fd, nullptr, nullptr,
                                     SOCK_NONBLOCK | SOCK_CLOEXEC);
@@ -661,6 +669,7 @@ WaylandProxy::~WaylandProxy() {
   if (mProxyServerSocket != -1) {
     close(mProxyServerSocket);
   }
+  SetWaylandDisplay();
 }
 
 void* WaylandProxy::RunProxyThread(WaylandProxy* aProxy) {
