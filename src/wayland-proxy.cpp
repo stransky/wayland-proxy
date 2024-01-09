@@ -76,8 +76,8 @@ class WaylandMessage {
  public:
   bool Write(int aSocket);
 
-  bool Loaded() { return mLoaded && (mFds.size() || mData.size()); }
-  bool Failed() { return mFailed; }
+  bool Loaded() const { return mLoaded && (mFds.size() || mData.size()); }
+  bool Failed() const { return mFailed; }
 
   explicit WaylandMessage(int aSocket) { Read(aSocket); }
   ~WaylandMessage();
@@ -90,7 +90,7 @@ class WaylandMessage {
   bool mFailed = false;
 
   std::vector<int> mFds;
-  std::vector<byte> mData;
+  std::vector<unsigned char> mData;
 };
 
 class ProxiedConnection {
@@ -285,7 +285,7 @@ bool ProxiedConnection::Init(int aApplicationSocket) {
   if (mCompositorSocket == -1) {
     Error("ProxiedConnection::Init() socket()");
   }
-  return mApplicationSocket > 0 && mCompositorSocket > 0;
+  return mApplicationSocket >= 0 && mCompositorSocket >= 0;
 }
 
 struct pollfd* ProxiedConnection::AddToPollFd(struct pollfd* aPfds) {
@@ -295,18 +295,19 @@ struct pollfd* ProxiedConnection::AddToPollFd(struct pollfd* aPfds) {
 
   // We're connected and we have data for appplication from compositor.
   // Add POLLOUT to request write to app socket.
-  if (mCompositorConnected && mToApplicationQueue.size()) {
+  if (mCompositorConnected && !mToApplicationQueue.empty()) {
     aPfds->events |= POLLOUT;
   }
   aPfds++;
 
   aPfds->fd = mCompositorSocket;
+  aPfds->events = 0;
   // We're waiting for connection or we have data for compositor
-  if (!mCompositorConnected || mToCompositorQueue.size()) {
+  if (!mCompositorConnected || !mToCompositorQueue.empty()) {
     aPfds->events |= POLLOUT;
   }
   if (mCompositorConnected) {
-    aPfds->events = POLLIN;
+    aPfds->events |= POLLIN;
   }
   aPfds++;
 
@@ -403,16 +404,28 @@ bool ProxiedConnection::FlushQueue(
     int aDestSocket, int aDestPollFlags,
     std::vector<std::unique_ptr<WaylandMessage>>& aMessageQueue) {
   // Can't write to destination yet
-  if (!(aDestPollFlags & POLLOUT)) {
+  if (!(aDestPollFlags & POLLOUT) || aMessageQueue.empty()) {
     return true;
   }
 
-  while (aMessageQueue.size()) {
-    if (!aMessageQueue[0]->Write(aDestSocket)) {
-      return !aMessageQueue[0]->Failed();
+  std::vector<std::unique_ptr<WaylandMessage>>::iterator message;
+  for (message = aMessageQueue.begin(); message != aMessageQueue.end();) {
+    if (!(*message)->Write(aDestSocket)) {
+      // Failed to write the message, remove whole connection
+      // as it's broken.
+      if ((*message)->Failed()) {
+        return false;
+      }
+      break;
     }
-    aMessageQueue.erase(aMessageQueue.begin());
+    message++;
   }
+
+  // Remove all written messages at once.
+  if (message != aMessageQueue.begin()) {
+    aMessageQueue.erase(aMessageQueue.begin(), message);
+  }
+
   return true;
 }
 
@@ -641,7 +654,7 @@ bool WaylandProxy::ProcessConnections() {
     if (!(*connection)->Process()) {
       Info("WaylandProxy: remove connection\n");
       connection = mConnections.erase(connection);
-      if (!mConnections.size()) {
+      if (mConnections.empty()) {
         // We removed last connection - quit.
         Info("WaylandProxy: removed last connection, quit\n");
         return false;
@@ -662,6 +675,7 @@ WaylandProxy::~WaylandProxy() {
   Info("WaylandProxy terminated\n");
   if (mThreadRunning) {
     Info("WaylandProxy thread is still running, terminating.\n");
+    mThreadRunning = false;
     pthread_cancel(mThread);
     pthread_join(mThread, nullptr);
   }
@@ -677,7 +691,6 @@ void* WaylandProxy::RunProxyThread(WaylandProxy* aProxy) {
   pthread_setname_np(pthread_self(), "WaylandProxy");
 #endif
   aProxy->Run();
-  aProxy->mThreadRunning = false;
   Info("WaylandProxy thread exited\n");
   return nullptr;
 }

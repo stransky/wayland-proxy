@@ -12,19 +12,22 @@
 #include <atomic>
 #include <memory>
 
-typedef unsigned char byte;
-
 class ProxiedConnection;
 
 class WaylandProxy {
  public:
-
   static std::unique_ptr<WaylandProxy> Create();
 
+  // Launch an application with Wayland proxy set
   bool RunChildApplication(char* argv[]);
+
+  // Run proxy as part of already running application
+  // and set Wayland proxy display for it.
   bool RunThread();
 
+  // Set original Wayland display env variable.
   void SetWaylandDisplay();
+
   static void SetVerbose(bool aVerbose);
 
   ~WaylandProxy();
