@@ -1,1 +1,1 @@
-g++ -g -O2 wayland-proxy.cpp main.cpp -o wayland-proxy
+c++ -std=gnu++17 -g -O2 wayland-proxy.cpp main.cpp -o wayland-proxy -pthread
