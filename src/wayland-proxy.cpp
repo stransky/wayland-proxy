@@ -687,7 +687,7 @@ WaylandProxy::~WaylandProxy() {
 }
 
 void* WaylandProxy::RunProxyThread(WaylandProxy* aProxy) {
-#ifdef __linux__
+#if defined(__linux__) || defined(__FreeBSD__)
   pthread_setname_np(pthread_self(), "WaylandProxy");
 #endif
   aProxy->Run();
