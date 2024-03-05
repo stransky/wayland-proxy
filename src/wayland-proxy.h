@@ -25,8 +25,9 @@ class WaylandProxy {
   // and set Wayland proxy display for it.
   bool RunThread();
 
-  // Set original Wayland display env variable.
-  void SetWaylandDisplay();
+  // Set original Wayland display env variable and clear
+  // proxy display file.
+  void RestoreWaylandDisplay();
 
   static void SetVerbose(bool aVerbose);
 
@@ -38,6 +39,7 @@ class WaylandProxy {
 
   void SetWaylandProxyDisplay();
   static void* RunProxyThread(WaylandProxy* aProxy);
+  bool CheckWaylandDisplay(const char* aWaylandDisplay);
 
   bool SetupWaylandDisplays();
   bool StartProxyServer();
@@ -46,6 +48,11 @@ class WaylandProxy {
   bool PollConnections();
   bool ProcessConnections();
 
+  void Info(const char* aFormat, ...);
+  void Warning(const char* aOperation);
+  void Error(const char* aOperation);
+  void ErrorPlain(const char* aFormat, ...);
+
  private:
   // List of all Compositor <-> Application connections
   std::vector<std::unique_ptr<ProxiedConnection>> mConnections;
@@ -53,6 +60,13 @@ class WaylandProxy {
   pid_t mApplicationPID = 0;
   std::atomic<bool> mThreadRunning = false;
   pthread_t mThread;
+
+  // sockaddr_un has hardcoded max len of sun_path
+  static constexpr int sMaxDisplayNameLen = 108;
+  // Name of Wayland display provided by compositor
+  char mWaylandDisplay[sMaxDisplayNameLen];
+  // Name of Wayland display provided by us
+  char mWaylandProxy[sMaxDisplayNameLen];
 };
 
 #endif  // _wayland_proxy_h_

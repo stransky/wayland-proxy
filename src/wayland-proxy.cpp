@@ -6,7 +6,7 @@
 // This code is based on Rust implementation at
 // https://github.com/the8472/weyland-p5000
 
-// Version 1.1
+// Version 1.2
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -34,18 +34,9 @@
 #define MAX_DATA_SIZE 4096
 #define POLL_TIMEOUT 30000
 
-// sockaddr_un has hardcoded max len of sun_path
-#define MAX_WAYLAND_DISPLAY_NAME_LEN 108
-
-// Name of Wayland display provided by compositor
-char sWaylandDisplay[MAX_WAYLAND_DISPLAY_NAME_LEN];
-
-// Name of Wayland display provided by us
-char sWaylandProxy[MAX_WAYLAND_DISPLAY_NAME_LEN];
-
 bool sPrintInfo = false;
 
-void Info(const char* aFormat, ...) {
+void Print(const char* aFormat, ...) {
   if (!sPrintInfo) {
     return;
   }
@@ -55,14 +46,12 @@ void Info(const char* aFormat, ...) {
   va_end(args);
 }
 
-void Warning(const char* aOperation, bool aPrintErrno = true) {
-  fprintf(stderr, "Wayland Proxy warning: %s : %s\n", aOperation,
-          aPrintErrno ? strerror(errno) : "");
+void Warning(const char* aOperation) {
+  fprintf(stderr, "Warning: %s : %s\n", aOperation, strerror(errno));
 }
 
-void Error(const char* aOperation, bool aPrintErrno = true) {
-  fprintf(stderr, "Wayland Proxy error: %s : %s\n", aOperation,
-          aPrintErrno ? strerror(errno) : "");
+void Error(const char* aOperation) {
+  fprintf(stderr, "Error: %s : %s\n", aOperation, strerror(errno));
 }
 
 void ErrorPlain(const char* aFormat, ...) {
@@ -76,17 +65,16 @@ class WaylandMessage {
  public:
   bool Write(int aSocket);
 
-  bool Loaded() const { return mLoaded && (mFds.size() || mData.size()); }
+  bool Loaded() const { return !mFailed && (mFds.size() || mData.size()); }
   bool Failed() const { return mFailed; }
 
   explicit WaylandMessage(int aSocket) { Read(aSocket); }
   ~WaylandMessage();
 
  private:
-  bool Read(int aSocket);
+  void Read(int aSocket);
 
  private:
-  bool mLoaded = false;
   bool mFailed = false;
 
   std::vector<int> mFds;
@@ -95,7 +83,7 @@ class WaylandMessage {
 
 class ProxiedConnection {
  public:
-  bool Init(int aChildSocket);
+  bool Init(int aChildSocket, char* aWaylandDisplay);
   bool IsConnected() { return mCompositorConnected; }
 
   struct pollfd* AddToPollFd(struct pollfd* aPfds);
@@ -117,8 +105,16 @@ class ProxiedConnection {
   bool FlushQueue(int aDestSocket, int aDestPollFlags,
                   std::vector<std::unique_ptr<WaylandMessage>>& aMessageQueue);
 
+  // Where we should connect.
+  // Weak pointer to parent WaylandProxy class.
+  char* mWaylandDisplay = nullptr;
+
   // We don't have connected compositor yet. Try to connect
   bool mCompositorConnected = false;
+
+  // Don't cycle endlessly over compositor connection
+  int mFailedCompositorConnections = 0;
+  static constexpr int sMaxFailedCompositorConnections = 100;
 
   // We're disconnected from app or compositor. We will close this connection.
   bool mFailed = false;
@@ -140,9 +136,9 @@ WaylandMessage::~WaylandMessage() {
   }
 }
 
-bool WaylandMessage::Read(int aSocket) {
+void WaylandMessage::Read(int aSocket) {
   // We don't expect WaylandMessage re-read
-  assert(!mLoaded && !mFailed);
+  assert(!Loaded() && !mFailed);
 
   mData.resize(MAX_DATA_SIZE);
 
@@ -159,7 +155,7 @@ bool WaylandMessage::Read(int aSocket) {
   if (msg.msg_flags & (MSG_CTRUNC | MSG_TRUNC)) {
     Error("WaylandMessage::Read() data truncated, small buffer?");
     mFailed = true;
-    return false;
+    return;
   }
 
   if (ret < 1) {
@@ -167,12 +163,12 @@ bool WaylandMessage::Read(int aSocket) {
       case EAGAIN:
       case EINTR:
         // Neither loaded nor failed, we'll try again later
-        Info("WaylandMessage::Write() failed %s\n", strerror(errno));
-        return false;
+        Print("WaylandMessage::Read() failed %s\n", strerror(errno));
+        return;
       default:
-        Error("WaylandMessage::Write() failed");
+        Error("WaylandMessage::Read() failed");
         mFailed = true;
-        return false;
+        return;
     }
   }
 
@@ -190,6 +186,11 @@ bool WaylandMessage::Read(int aSocket) {
 
     int* data = (int*)CMSG_DATA(header);
     int filenum = (int)((header->cmsg_len - CMSG_LEN(0)) / sizeof(int));
+    if (filenum > MAX_LIBWAY_FDS) {
+      ErrorPlain("WaylandMessage::Read(): too many files to read\n");
+      mFailed = true;
+      return;
+    }
     for (int i = 0; i < filenum; i++) {
 #ifdef DEBUG
       int flags = fcntl(data[i], F_GETFL, 0);
@@ -201,13 +202,10 @@ bool WaylandMessage::Read(int aSocket) {
     }
     header = next;
   }
-
-  mLoaded = true;
-  return true;
 }
 
 bool WaylandMessage::Write(int aSocket) {
-  if (!mLoaded || mFailed) {
+  if (!Loaded()) {
     return false;
   }
 
@@ -216,10 +214,16 @@ bool WaylandMessage::Write(int aSocket) {
   msg.msg_iov = &iov;
   msg.msg_iovlen = 1;
 
+  union {
+    char buf[CMSG_SPACE(sizeof(int) * MAX_LIBWAY_FDS)];
+    struct cmsghdr align;
+  } cmsgu;
+  memset(cmsgu.buf, 0, sizeof(cmsgu.buf));
+
   int filenum = mFds.size();
   if (filenum) {
-    if (filenum >= MAX_LIBWAY_FDS) {
-      Error("WaylandMessage::Write() too many files to send\n", false);
+    if (filenum > MAX_LIBWAY_FDS) {
+      ErrorPlain("WaylandMessage::Write() too many files to send\n");
       return false;
     }
 #ifdef DEBUG
@@ -230,14 +234,7 @@ bool WaylandMessage::Write(int aSocket) {
       }
     }
 #endif
-    union {
-      char buf[CMSG_SPACE(sizeof(int) * MAX_LIBWAY_FDS)];
-      struct cmsghdr align;
-    } cmsgu;
-    memset(cmsgu.buf, 0, sizeof(cmsgu.buf));
-
     msg.msg_control = cmsgu.buf;
-    msg.msg_controllen = sizeof(cmsgu.buf);
     msg.msg_controllen = CMSG_SPACE(filenum * sizeof(int));
 
     struct cmsghdr* cmsg = CMSG_FIRSTHDR(&msg);
@@ -253,7 +250,7 @@ bool WaylandMessage::Write(int aSocket) {
       case EAGAIN:
       case EINTR:
         // Neither loaded nor failed, we'll try again later
-        Info("WaylandMessage::Write() failed %s\n", strerror(errno));
+        Print("WaylandMessage::Write() failed %s\n", strerror(errno));
         return false;
       default:
         Warning("WaylandMessage::Write() failed");
@@ -263,7 +260,7 @@ bool WaylandMessage::Write(int aSocket) {
   }
 
   if (ret != (ssize_t)mData.size()) {
-    Info("WaylandMessage::Write() failed to write all data! (%d vs. %d)\n", ret,
+    Print("WaylandMessage::Write() failed to write all data! (%d vs. %d)\n", ret,
          mData.size());
   }
   return true;
@@ -278,14 +275,17 @@ ProxiedConnection::~ProxiedConnection() {
   }
 }
 
-bool ProxiedConnection::Init(int aApplicationSocket) {
+bool ProxiedConnection::Init(int aApplicationSocket, char* aWaylandDisplay) {
+  mWaylandDisplay = aWaylandDisplay;
   mApplicationSocket = aApplicationSocket;
   mCompositorSocket =
       socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
   if (mCompositorSocket == -1) {
-    Error("ProxiedConnection::Init() socket()");
+    Error("WaylandProxy: ProxiedConnection::Init() socket()");
   }
-  return mApplicationSocket >= 0 && mCompositorSocket >= 0;
+  bool ret = mApplicationSocket >= 0 && mCompositorSocket >= 0;
+  Print("WaylandProxy: ProxiedConnection::Init() %s\n", ret ? "OK" : "FAILED");
+  return ret;
 }
 
 struct pollfd* ProxiedConnection::AddToPollFd(struct pollfd* aPfds) {
@@ -328,7 +328,7 @@ struct pollfd* ProxiedConnection::LoadPollFd(struct pollfd* aPfds) {
 bool ProxiedConnection::ConnectToCompositor() {
   struct sockaddr_un addr = {};
   addr.sun_family = AF_UNIX;
-  strcpy(addr.sun_path, sWaylandDisplay);
+  strcpy(addr.sun_path, mWaylandDisplay);
 
   mCompositorConnected =
       connect(mCompositorSocket, (const struct sockaddr*)&addr,
@@ -342,6 +342,11 @@ bool ProxiedConnection::ConnectToCompositor() {
       case EINTR:
       case EISCONN:
       case ETIMEDOUT:
+        mFailedCompositorConnections++;
+        if (mFailedCompositorConnections > sMaxFailedCompositorConnections) {
+          Error("ConnectToCompositor() connect() failed repeatedly");
+          return false;
+        }
         // We can recover from these errors and try again
         Warning("ConnectToCompositor() try again");
         return true;
@@ -442,7 +447,7 @@ bool ProxiedConnection::Process() {
   } else {
     // Try to reconnect to compositor.
     if (!ConnectToCompositor()) {
-      Info("Failed to connect to compositor\n");
+      Print("Failed to connect to compositor\n");
       return false;
     }
     // We're not connected yet but ConnectToCompositor() didn't return
@@ -463,42 +468,93 @@ bool ProxiedConnection::Process() {
   return !mFailed;
 }
 
-bool WaylandProxy::SetupWaylandDisplays() {
-  char* waylandDisplay = getenv("WAYLAND_DISPLAY");
-  if (!waylandDisplay) {
-    Error("Init(), Missing Wayland display, WAYLAND_DISPLAY is empty.", false);
+bool WaylandProxy::CheckWaylandDisplay(const char* aWaylandDisplay) {
+  struct sockaddr_un addr = {};
+  addr.sun_family = AF_UNIX;
+  strcpy(addr.sun_path, aWaylandDisplay);
+
+  int sc = socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+  if (sc == -1) {
+    Error("CheckWaylandDisplay(): failed to create socket");
     return false;
+  }
+
+  bool ret =
+      connect(sc, (const struct sockaddr*)&addr,
+              sizeof(struct sockaddr_un)) != -1;
+  if (!ret) {
+    switch (errno) {
+      case EAGAIN:
+      case EALREADY:
+      case ECONNREFUSED:
+      case EINPROGRESS:
+      case EINTR:
+      case EISCONN:
+      case ETIMEDOUT:
+        // We can recover from these errors and try again
+        ret = true;
+        break;
+      default:
+        ErrorPlain(
+          "CheckWaylandDisplay(): Failed to connect to Wayland display '%s' error: %s\n",
+          mWaylandDisplay, strerror(errno));
+        break;
+    }
+  }
+
+  close(sc);
+  return ret;
+}
+
+
+bool WaylandProxy::SetupWaylandDisplays() {
+  char* waylandDisplay = getenv("WAYLAND_DISPLAY_COMPOSITOR");
+  if (!waylandDisplay) {
+    waylandDisplay = getenv("WAYLAND_DISPLAY");
+    if (!waylandDisplay || waylandDisplay[0] == '\0') {
+      ErrorPlain("WaylandProxy::SetupWaylandDisplays(), Missing Wayland display, WAYLAND_DISPLAY is empty.\n");
+      return false;
+    }
   }
 
   char* XDGRuntimeDir = getenv("XDG_RUNTIME_DIR");
   if (!XDGRuntimeDir) {
-    Error("Init() Missing XDG_RUNTIME_DIR", false);
+    ErrorPlain("WaylandProxy::SetupWaylandDisplays() Missing XDG_RUNTIME_DIR\n");
     return false;
   }
 
   // WAYLAND_DISPLAY can be absolute path
   if (waylandDisplay[0] == '/') {
-    if (strlen(sWaylandDisplay) >= MAX_WAYLAND_DISPLAY_NAME_LEN) {
-      Error("Init() WAYLAND_DISPLAY is too large.", false);
+    if (strlen(mWaylandDisplay) >= sMaxDisplayNameLen) {
+      ErrorPlain("WaylandProxy::SetupWaylandDisplays() WAYLAND_DISPLAY is too large.\n");
       return false;
     }
-    strcpy(sWaylandDisplay, waylandDisplay);
+    strcpy(mWaylandDisplay, waylandDisplay);
   } else {
-    int ret = snprintf(sWaylandDisplay, MAX_WAYLAND_DISPLAY_NAME_LEN, "%s/%s",
+    int ret = snprintf(mWaylandDisplay, sMaxDisplayNameLen, "%s/%s",
                        XDGRuntimeDir, waylandDisplay);
-    if (ret < 0 || ret >= MAX_WAYLAND_DISPLAY_NAME_LEN) {
-      Error("Init() WAYLAND_DISPLAY/XDG_RUNTIME_DIR is too large.", false);
+    if (ret < 0 || ret >= sMaxDisplayNameLen) {
+      ErrorPlain("WaylandProxy::SetupWaylandDisplays() WAYLAND_DISPLAY/XDG_RUNTIME_DIR is too large.\n");
       return false;
     }
   }
-  int ret = snprintf(sWaylandProxy, MAX_WAYLAND_DISPLAY_NAME_LEN,
-                     "%s/wayland-proxy-%d", XDGRuntimeDir, getpid());
-  if (ret < 0 || ret >= MAX_WAYLAND_DISPLAY_NAME_LEN) {
-    Error("Init() WAYLAND_DISPLAY/XDG_RUNTIME_DIR is too large.", false);
+
+  if (!CheckWaylandDisplay(mWaylandDisplay)) {
     return false;
   }
 
-  Info("WaylandProxy Wayland '%s' proxy '%s'\n", sWaylandDisplay, sWaylandProxy);
+  int ret = snprintf(mWaylandProxy, sMaxDisplayNameLen,
+                     "%s/wayland-proxy-%d", XDGRuntimeDir, getpid());
+  if (ret < 0 || ret >= sMaxDisplayNameLen) {
+    ErrorPlain("WaylandProxy::SetupWaylandDisplays() WAYLAND_DISPLAY/XDG_RUNTIME_DIR is too large.\n");
+    return false;
+  }
+
+  // Save original Wayland display variable for potential reuse
+  setenv("WAYLAND_DISPLAY_COMPOSITOR", waylandDisplay, /* overwrite = */ true);
+
+  Info("SetupWaylandDisplays() Wayland '%s' proxy '%s'\n",
+       mWaylandDisplay, mWaylandProxy);
   return true;
 }
 
@@ -512,7 +568,7 @@ bool WaylandProxy::StartProxyServer() {
 
   struct sockaddr_un serverName = {0};
   serverName.sun_family = AF_UNIX;
-  strcpy(serverName.sun_path, sWaylandProxy);
+  strcpy(serverName.sun_path, mWaylandProxy);
 
   if (bind(mProxyServerSocket, (struct sockaddr*)&serverName,
            sizeof(serverName)) == -1) {
@@ -528,6 +584,8 @@ bool WaylandProxy::StartProxyServer() {
 }
 
 bool WaylandProxy::Init() {
+  Info("Init()\n");
+
   if (!SetupWaylandDisplays()) {
     return false;
   }
@@ -535,15 +593,25 @@ bool WaylandProxy::Init() {
   if (!StartProxyServer()) {
     return false;
   }
+
+  Info("Init() finished\n");
   return true;
 }
 
 void WaylandProxy::SetWaylandProxyDisplay() {
-  setenv("WAYLAND_DISPLAY", sWaylandProxy, true);
+  Info("SetWaylandProxyDisplay() WAYLAND_DISPLAY %s\n", mWaylandDisplay);
+  setenv("WAYLAND_DISPLAY", mWaylandProxy, /* overwrite = */ true);
 }
 
-void WaylandProxy::SetWaylandDisplay() {
-  setenv("WAYLAND_DISPLAY", sWaylandDisplay, true);
+void WaylandProxy::RestoreWaylandDisplay() {
+  unlink(mWaylandProxy);
+  char* waylandDisplay = getenv("WAYLAND_DISPLAY_COMPOSITOR");
+  if (waylandDisplay) {
+    Info("RestoreWaylandDisplay() WAYLAND_DISPLAY restored to %s\n",
+         waylandDisplay);
+    setenv("WAYLAND_DISPLAY", waylandDisplay, /* overwrite = */ true);
+    unsetenv("WAYLAND_DISPLAY_COMPOSITOR");
+  }
 }
 
 bool WaylandProxy::IsChildAppTerminated() {
@@ -619,7 +687,7 @@ bool WaylandProxy::PollConnections() {
 
   // Create a new connection if there's a new client waiting
   if (addNewConnection && (loadedPollfd->revents & POLLIN)) {
-    Info("WaylandProxy: new child connection\n");
+    Info("new child connection\n");
     int applicationSocket = accept4(loadedPollfd->fd, nullptr, nullptr,
                                     SOCK_NONBLOCK | SOCK_CLOEXEC);
     if (applicationSocket == -1) {
@@ -634,7 +702,7 @@ bool WaylandProxy::PollConnections() {
       }
     } else {
       auto connection = std::make_unique<ProxiedConnection>();
-      if (connection->Init(applicationSocket)) {
+      if (connection->Init(applicationSocket, mWaylandDisplay)) {
         mConnections.push_back(std::move(connection));
       }
     }
@@ -647,11 +715,11 @@ bool WaylandProxy::ProcessConnections() {
   std::vector<std::unique_ptr<ProxiedConnection>>::iterator connection;
   for (connection = mConnections.begin(); connection != mConnections.end();) {
     if (!(*connection)->Process()) {
-      Info("WaylandProxy: remove connection\n");
+      Info("remove connection\n");
       connection = mConnections.erase(connection);
       if (mConnections.empty()) {
         // We removed last connection - quit.
-        Info("WaylandProxy: removed last connection, quit\n");
+        Info("removed last connection, quit\n");
         return false;
       }
     } else {
@@ -667,18 +735,17 @@ void WaylandProxy::Run() {
 }
 
 WaylandProxy::~WaylandProxy() {
-  Info("WaylandProxy terminated\n");
+  Info("terminated\n");
   if (mThreadRunning) {
-    Info("WaylandProxy thread is still running, terminating.\n");
+    Info("thread is still running, terminating.\n");
     mThreadRunning = false;
     pthread_cancel(mThread);
     pthread_join(mThread, nullptr);
   }
-  unlink(sWaylandProxy);
   if (mProxyServerSocket != -1) {
     close(mProxyServerSocket);
   }
-  SetWaylandDisplay();
+  RestoreWaylandDisplay();
 }
 
 void* WaylandProxy::RunProxyThread(WaylandProxy* aProxy) {
@@ -686,23 +753,23 @@ void* WaylandProxy::RunProxyThread(WaylandProxy* aProxy) {
   pthread_setname_np(pthread_self(), "WaylandProxy");
 #endif
   aProxy->Run();
-  Info("WaylandProxy thread exited\n");
+  Print("[%d] WaylandProxy [%p]: thread exited.\n", getpid(), aProxy);
   return nullptr;
 }
 
 std::unique_ptr<WaylandProxy> WaylandProxy::Create() {
   auto proxy = std::make_unique<WaylandProxy>();
+  Print("[%d] WaylandProxy [%p]: Created().\n", getpid(), proxy.get());
   if (!proxy->Init()) {
+    Print("[%d] WaylandProxy [%p]: Init failed, exiting.\n", getpid(), proxy.get());
     return nullptr;
   }
-
-  Info("WaylandProxyCreated, display %s\n", sWaylandProxy);
   return proxy;
 }
 
 bool WaylandProxy::RunChildApplication(char* argv[]) {
   if (!argv[0]) {
-    Error("WaylandProxy::RunChildApplication: missing application to run", false);
+    ErrorPlain("WaylandProxy::RunChildApplication: missing application to run\n");
     return false;
   }
 
@@ -714,7 +781,9 @@ bool WaylandProxy::RunChildApplication(char* argv[]) {
   if (mApplicationPID == 0) {
     SetWaylandProxyDisplay();
     if (execv(argv[0], argv) == -1) {
-      ErrorPlain("WaylandProxy::RunChildApplication: failed to run %s error %s\n", argv[0], strerror(errno));
+      ErrorPlain(
+        "WaylandProxy::RunChildApplication: failed to run %s error %s\n",
+        argv[0], strerror(errno));
       exit(1);
     }
   }
@@ -726,6 +795,7 @@ bool WaylandProxy::RunChildApplication(char* argv[]) {
 bool WaylandProxy::RunThread() {
   pthread_attr_t attr;
   if (pthread_attr_init(&attr) != 0) {
+    ErrorPlain("WaylandProxy::RunThread(): pthread_attr_init() failed\n");
     return false;
   }
 
@@ -739,8 +809,9 @@ bool WaylandProxy::RunThread() {
 
   mThreadRunning = pthread_create(&mThread, nullptr, (void* (*)(void*))RunProxyThread, this) == 0;
   if (!mThreadRunning) {
+    ErrorPlain("WaylandProxy::RunThread(): pthread_create() failed\n");
     // If we failed to run proxy thread, set WAYLAND_DISPLAY back.
-    SetWaylandDisplay();
+    RestoreWaylandDisplay();
   }
 
   pthread_attr_destroy(&attr);
@@ -748,3 +819,32 @@ bool WaylandProxy::RunThread() {
 }
 
 void WaylandProxy::SetVerbose(bool aVerbose) { sPrintInfo = aVerbose; }
+
+void WaylandProxy::Info(const char* aFormat, ...) {
+  if (!sPrintInfo) {
+    return;
+  }
+  fprintf(stderr,"[%d] WaylandProxy [%p]: ", getpid(), this);
+  va_list args;
+  va_start(args, aFormat);
+  vfprintf(stderr, aFormat, args);
+  va_end(args);
+}
+
+void WaylandProxy::Warning(const char* aOperation) {
+  fprintf(stderr, "[%d] Wayland Proxy [%p] Warning: %s : %s\n",
+          getpid(), this, aOperation, strerror(errno));
+}
+
+void WaylandProxy::Error(const char* aOperation) {
+  fprintf(stderr, "[%d] Wayland Proxy [%p] Error: %s : %s\n",
+          getpid(), this, aOperation, strerror(errno));
+}
+
+void WaylandProxy::ErrorPlain(const char* aFormat, ...) {
+  fprintf(stderr, "[%d] Wayland Proxy [%p] Error: ", getpid(), this);
+  va_list args;
+  va_start(args, aFormat);
+  vfprintf(stderr, aFormat, args);
+  va_end(args);
+}
