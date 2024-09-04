@@ -1,7 +1,7 @@
 # Wayland proxy
 
 Wayland proxy is load balancer between Wayland compositor and Wayland client. It prevents Wayland client to be
-disconnected by Wayland compositor if Wayland client is bussy or under heavy load.
+disconnected by Wayland compositor if Wayland client is busy or under heavy load.
 
 This C++ implementation is based on Rust one at https://github.com/the8472/weyland-p5000
 
