@@ -9,6 +9,7 @@
 // Version 1.2
 
 #include <stdio.h>
+#include <string.h>
 #include <stdlib.h>
 #include <stdarg.h>
 #include <sys/ioctl.h>
