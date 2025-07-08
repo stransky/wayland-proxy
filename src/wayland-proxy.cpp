@@ -151,7 +151,7 @@ void WaylandMessage::Read(int aSocket) {
   msg.msg_control = &cmsgdata;
   msg.msg_controllen = sizeof(cmsgdata);
 
-  ssize_t ret = recvmsg(aSocket, &msg, MSG_CMSG_CLOEXEC | MSG_DONTWAIT);
+  ssize_t ret = recvmsg(aSocket, &msg, MSG_DONTWAIT);
   if (msg.msg_flags & (MSG_CTRUNC | MSG_TRUNC)) {
     Error("WaylandMessage::Read() data truncated, small buffer?");
     mFailed = true;
